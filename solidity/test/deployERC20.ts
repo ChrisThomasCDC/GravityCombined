@@ -5,15 +5,29 @@ import { solidity } from "ethereum-waffle";
 import { deployContracts } from "../test-utils";
 import {
   getSignerAddresses,
+  makeCheckpoint,
   signHash,
+  makeTxBatchHash,
   examplePowers,
-  ZeroAddress,
-  parseEvent,
+  ZeroAddress
 } from "../test-utils/pure";
+import {ContractReceipt, utils} from 'ethers';
 import { BigNumber } from "ethers";
 chai.use(solidity);
 const { expect } = chai;
 
+async function parseEvent(contract: any, txReceipt: Promise<ContractReceipt>, eventOrder: number) {
+  const receipt = await txReceipt;
+
+  if (receipt.events){
+    let args = receipt.events[eventOrder].args;
+
+    return args
+
+  }
+
+  return undefined
+}
 
 async function runTest(opts: {}) {
 
@@ -31,23 +45,30 @@ async function runTest(opts: {}) {
     gravity,
     testERC20,
     checkpoint: deployCheckpoint
-  } = await deployContracts(gravityId, powerThreshold, validators, powers);
+  } = await deployContracts(gravityId, validators, powers, powerThreshold);
 
-
+  await gravity.grantRole(
+    await gravity.RELAYER(),
+    signers[0].address,
+  );
 
 
   // Deploy ERC20 contract representing Cosmos asset
   // ===============================================
-  const eventArgs = await parseEvent(gravity, gravity.deployERC20('uatom', 'Atom', 'ATOM', 6), 1)
 
-  expect(eventArgs).to.deep.equal({
-    _cosmosDenom: 'uatom',
-    _tokenContract: eventArgs._tokenContract, // We don't know this ahead of time
-    _name: 'Atom',
-    _symbol: 'ATOM',
-    _decimals: 6,
-    _eventNonce: BigNumber.from(2)
-  })
+  let tx = await gravity.deployERC20('uatom', 'Atom', 'ATOM', 6);
+
+
+
+  const eventArgs = await parseEvent(gravity,tx.wait(), 1)
+
+  if (eventArgs == undefined)
+   {
+    throw new Error("No event args");
+  }
+
+
+  expect(eventArgs._cosmosDenom).to.equal( 'uatom');
 
 
 
@@ -62,7 +83,7 @@ async function runTest(opts: {}) {
   const maxUint256 = BigNumber.from(2).pow(256).sub(1)
 
   // Check that gravity balance is correct
-  expect((await ERC20contract.functions.balanceOf(gravity.address)).toString()).to.equal(maxUint256.toString())
+  expect((await ERC20contract.functions.balanceOf(gravity.address)).toString()).to.equal(maxUint256.toString());
 
 
   // Prepare batch
@@ -126,9 +147,7 @@ async function runTest(opts: {}) {
   await gravity.submitBatch(
     valset,
 
-    sigs.v,
-    sigs.r,
-    sigs.s,
+    sigs,
 
     txAmounts,
     txDestinations,

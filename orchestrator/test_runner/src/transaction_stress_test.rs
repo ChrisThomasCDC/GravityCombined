@@ -1,16 +1,18 @@
-use crate::{get_fee, one_eth, one_hundred_eth, utils::*, TOTAL_TIMEOUT};
-use clarity::Address as EthAddress;
-use cosmos_gravity::send::{send_request_batch, send_to_eth};
+use crate::{
+    one_eth, one_hundred_eth, one_hundred_eth_uint256, utils::*, MINER_CLIENT, TOTAL_TIMEOUT,
+};
+use clarity::Uint256;
+use cosmos_gravity::send::{send_request_batch_tx, send_to_eth};
 use deep_space::coin::Coin;
 use deep_space::Contact;
-use ethereum_gravity::{send_to_cosmos::send_to_cosmos, utils::get_tx_batch_nonce};
-use futures::future::join_all;
-use std::{
-    collections::HashSet,
-    time::{Duration, Instant},
+use ethereum_gravity::{
+    erc20_utils::get_erc20_balance, send_to_cosmos::send_to_cosmos, utils::get_tx_batch_nonce,
 };
-use tokio::time::sleep as delay_for;
-use web30::client::Web3;
+use ethers::prelude::*;
+use ethers::types::Address as EthAddress;
+use futures::future::join_all;
+use gravity_utils::ethereum::downcast_to_u64;
+use std::{collections::HashSet, str::FromStr, sync::Arc, time::Duration};
 
 const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -29,15 +31,12 @@ const NUM_USERS: usize = 100;
 /// transactions and producing large batches
 #[allow(clippy::too_many_arguments)]
 pub async fn transaction_stress_test(
-    web30: &Web3,
+    eth_provider: &Provider<Http>,
     contact: &Contact,
     keys: Vec<ValidatorKeys>,
     gravity_address: EthAddress,
     erc20_addresses: Vec<EthAddress>,
 ) {
-    let no_relay_market_config = create_default_test_config();
-    start_orchestrators(keys.clone(), gravity_address, false, no_relay_market_config).await;
-
     // Generate 100 user keys to send ETH and multiple types of tokens
     let mut user_keys = Vec::new();
     for _ in 0..NUM_USERS {
@@ -51,39 +50,48 @@ pub async fn transaction_stress_test(
     let mut eth_destinations = Vec::new();
     eth_destinations.extend(sending_eth_addresses.clone());
     eth_destinations.extend(dest_eth_addresses);
-    send_eth_bulk(one_eth(), &eth_destinations, web30).await;
+    send_eth_bulk(one_eth(), &eth_destinations, (*MINER_CLIENT).clone()).await;
     info!("Sent {} addresses 1 ETH", NUM_USERS);
 
     // now we need to send all the sending eth addresses erc20's to send
     for token in erc20_addresses.iter() {
-        send_erc20_bulk(one_hundred_eth(), *token, &sending_eth_addresses, web30).await;
+        send_erc20_bulk(
+            one_hundred_eth(),
+            *token,
+            &sending_eth_addresses,
+            (*MINER_CLIENT).clone(),
+        )
+        .await;
         info!("Sent {} addresses 100 {}", NUM_USERS, token);
     }
     for token in erc20_addresses.iter() {
         let mut sends = Vec::new();
         for keys in user_keys.iter() {
+            let eth_wallet = LocalWallet::from(keys.eth_key.clone());
+            let provider = eth_provider.clone();
+            let chain_id = provider
+                .get_chainid()
+                .await
+                .expect("Could not retrieve chain ID");
+            let chain_id =
+                downcast_to_u64(chain_id).expect("Chain ID overflowed when downcasting to u64");
+            let eth_client = Arc::new(SignerMiddleware::new(
+                provider,
+                eth_wallet.with_chain_id(chain_id),
+            ));
             let fut = send_to_cosmos(
                 *token,
                 gravity_address,
                 one_hundred_eth(),
                 keys.cosmos_address,
-                keys.eth_key,
                 Some(TIMEOUT),
-                web30,
-                Vec::new(),
+                eth_client.clone(),
             );
             sends.push(fut);
         }
-        let txids = join_all(sends).await;
-        let mut wait_for_txid = Vec::new();
-        for txid in txids {
-            let wait = web30.wait_for_transaction(txid.unwrap(), TIMEOUT, None);
-            wait_for_txid.push(wait);
-        }
-        let results = join_all(wait_for_txid).await;
+        let results = join_all(sends).await;
         for result in results {
-            let result = result.unwrap();
-            result.block_number.unwrap();
+            result.unwrap();
         }
         info!(
             "Locked 100 {} from {} into the Gravity Ethereum Contract",
@@ -91,44 +99,50 @@ pub async fn transaction_stress_test(
         );
     }
 
-    let start = Instant::now();
     let mut good = true;
-    while Instant::now() - start < TOTAL_TIMEOUT {
-        good = true;
-        for keys in user_keys.iter() {
-            let c_addr = keys.cosmos_address;
-            let balances = contact.get_balances(c_addr).await.unwrap();
-            for token in erc20_addresses.iter() {
-                let mut found = false;
-                for balance in balances.iter() {
-                    if balance.denom.contains(&token.to_string())
-                        && balance.amount == one_hundred_eth()
-                    {
-                        found = true;
+    match tokio::time::timeout(TOTAL_TIMEOUT, async {
+        loop {
+            good = true;
+            for keys in user_keys.iter() {
+                let c_addr = keys.cosmos_address;
+                let balances = contact.get_balances(c_addr).await.unwrap();
+                for token in erc20_addresses.iter() {
+                    let mut found = false;
+                    for balance in balances.iter() {
+                        if balance.denom.contains(&token.to_string())
+                            && balance.amount == one_hundred_eth_uint256()
+                        {
+                            found = true;
+                        }
+                    }
+                    if !found {
+                        good = false;
                     }
                 }
-                if !found {
-                    good = false;
-                }
             }
+            if good {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        if good {
+    })
+    .await
+    {
+        Ok(_) => {
             info!(
                 "All {} deposits bridged to Cosmos successfully!",
                 user_keys.len() * erc20_addresses.len()
             );
-            break;
         }
-        delay_for(Duration::from_secs(5)).await;
-    }
-    if !good {
-        panic!(
-            "Failed to perform all {} deposits to Cosmos!",
-            user_keys.len() * erc20_addresses.len()
-        );
+        Err(_) => {
+            panic!(
+                "Failed to perform all {} deposits to Cosmos!",
+                user_keys.len() * erc20_addresses.len()
+            );
+        }
     }
 
-    let send_amount = one_hundred_eth() - 500u16.into();
+    let send_amount = one_hundred_eth_uint256() - 500u16.into();
 
     let mut denoms = HashSet::new();
     for token in erc20_addresses.iter() {
@@ -157,9 +171,10 @@ pub async fn transaction_stress_test(
                 c_key,
                 e_dest_addr,
                 send_coin,
-                send_fee.clone(),
                 send_fee,
+                (0f64, "".to_string()),
                 contact,
+                1.0,
             );
             futs.push(res);
         }
@@ -176,53 +191,64 @@ pub async fn transaction_stress_test(
 
     for denom in denoms {
         info!("Requesting batch for {}", denom);
-        let res = send_request_batch(keys[0].validator_key, denom, get_fee(), contact)
-            .await
-            .unwrap();
+        let res = send_request_batch_tx(
+            keys[0].validator_key,
+            denom,
+            (0f64, "".to_string()),
+            contact,
+            1.0,
+        )
+        .await
+        .unwrap();
         info!("batch request response is {:?}", res);
     }
 
-    let start = Instant::now();
-    let mut good = true;
-    while Instant::now() - start < TOTAL_TIMEOUT {
-        good = true;
-        for keys in user_keys.iter() {
-            let e_dest_addr = keys.eth_dest_address;
-            for token in erc20_addresses.iter() {
-                let bal = web30.get_erc20_balance(*token, e_dest_addr).await.unwrap();
-                if bal != send_amount.clone() {
-                    good = false;
+    match tokio::time::timeout(TOTAL_TIMEOUT, async {
+        loop {
+            good = true;
+            for keys in user_keys.iter() {
+                let e_dest_addr = keys.eth_dest_address;
+                for token in erc20_addresses.iter() {
+                    let bal = get_erc20_balance(*token, e_dest_addr, (*MINER_CLIENT).clone())
+                        .await
+                        .unwrap();
+                    let bal = Uint256::from_str(bal.to_string().as_str()).unwrap();
+                    if bal != send_amount.clone() {
+                        good = false;
+                    }
                 }
             }
+            if good {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        if good {
+    })
+    .await
+    {
+        Ok(_) => {
             info!(
                 "All {} withdraws to Ethereum bridged successfully!",
                 NUM_USERS * erc20_addresses.len()
             );
-            break;
         }
-        delay_for(Duration::from_secs(5)).await;
-    }
-    if !good {
-        panic!(
-            "Failed to perform all {} withdraws to Ethereum!",
-            NUM_USERS * erc20_addresses.len()
-        );
+        Err(_) => {
+            panic!(
+                "Failed to perform all {} withdraws to Ethereum!",
+                NUM_USERS * erc20_addresses.len()
+            );
+        }
     }
 
     // we should find a batch nonce greater than zero since all the batches
     // executed
+    let eth_wallet = LocalWallet::from(keys[0].eth_key.clone());
+    let eth_client = Arc::new(SignerMiddleware::new(eth_provider.clone(), eth_wallet));
     for token in erc20_addresses {
         assert!(
-            get_tx_batch_nonce(
-                gravity_address,
-                token,
-                keys[0].eth_key.to_public_key().unwrap(),
-                web30
-            )
-            .await
-            .unwrap()
+            get_tx_batch_nonce(gravity_address, token, eth_client.clone())
+                .await
+                .unwrap()
                 > 0
         )
     }

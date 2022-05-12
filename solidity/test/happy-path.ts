@@ -8,7 +8,7 @@ import {
   makeCheckpoint,
   signHash,
   examplePowers,
-  ZeroAddress,
+  ZeroAddress
 } from "../test-utils/pure";
 
 chai.use(solidity);
@@ -33,16 +33,18 @@ describe("Gravity happy path valset update + batch submit", function () {
       rewardToken: ZeroAddress
     }
 
-
     const powerThreshold = 6666;
 
     const {
       gravity,
       testERC20,
       checkpoint: deployCheckpoint
-    } = await deployContracts(gravityId, powerThreshold, valset0.validators, valset0.powers);
+    } = await deployContracts(gravityId, valset0.validators, valset0.powers, powerThreshold);
 
-
+    await gravity.grantRole(
+      await gravity.RELAYER(),
+      signers[0].address,
+    );
 
 
     // UDPATEVALSET
@@ -63,6 +65,9 @@ describe("Gravity happy path valset update + batch submit", function () {
         rewardToken: ZeroAddress
       }
     })()
+
+
+
 
     // redefine valset0 and 1 with strings for 'validators'
     const valset0_str = {
@@ -91,29 +96,27 @@ describe("Gravity happy path valset update + batch submit", function () {
 
     let sigs1 = await signHash(valset0.validators, checkpoint1);
 
+
     await gravity.updateValset(
       valset1_str,
 
       valset0_str,
 
-      sigs1.v,
-      sigs1.r,
-      sigs1.s
+      sigs1,
     );
 
     expect((await gravity.functions.state_lastValsetCheckpoint())[0]).to.equal(checkpoint1);
 
 
 
-
-    // SUBMITBATCH
+// SUBMITBATCH
     // ==========================
 
     // Transfer out to Cosmos, locking coins
     await testERC20.functions.approve(gravity.address, 1000);
-    await gravity.functions.sendToCosmos(
+    await gravity.functions.sendToCronos(
       testERC20.address,
-      ethers.utils.formatBytes32String("myCosmosAddress"),
+      "0xffffffffffffffffffffffffffffffffffffffff",
       1000
     );
 
@@ -169,9 +172,7 @@ describe("Gravity happy path valset update + batch submit", function () {
     let batchSubmitTx = await gravity.submitBatch(
       valset1_str,
 
-      sigs.v,
-      sigs.r,
-      sigs.s,
+      sigs,
 
       txAmounts,
       txDestinations,

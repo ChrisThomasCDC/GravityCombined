@@ -1,8 +1,7 @@
 use super::*;
 use crate::error::GravityError;
-use clarity::Signature as EthSignature;
-use clarity::{utils::hex_str_to_bytes, Address as EthAddress};
-use deep_space::Address as CosmosAddress;
+use ethers::types::{Address as EthAddress, Signature as EthSignature};
+use std::{convert::TryFrom, result::Result};
 
 /// the response we get when querying for a valset confirmation
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -17,36 +16,23 @@ pub struct LogicCall {
 }
 
 impl LogicCall {
-    pub fn from_proto(
-        input: gravity_proto::gravity::OutgoingLogicCall,
-    ) -> Result<Self, GravityError> {
+    pub fn from_proto(input: gravity_proto::gravity::ContractCallTx) -> Result<Self, GravityError> {
         let mut transfers: Vec<Erc20Token> = Vec::new();
         let mut fees: Vec<Erc20Token> = Vec::new();
-        for transfer in input.transfers {
-            transfers.push(Erc20Token {
-                amount: transfer.amount.parse()?,
-                token_contract_address: transfer.contract.parse()?,
-            })
+        for token in input.tokens {
+            transfers.push(Erc20Token::from_proto(token)?)
         }
         for fee in input.fees {
-            fees.push(Erc20Token {
-                amount: fee.amount.parse()?,
-                token_contract_address: fee.contract.parse()?,
-            })
-        }
-        if transfers.is_empty() || fees.is_empty() {
-            return Err(GravityError::InvalidBridgeStateError(
-                "Transaction batch containing no transactions!".to_string(),
-            ));
+            fees.push(Erc20Token::from_proto(fee)?)
         }
 
         Ok(LogicCall {
             transfers,
             fees,
-            logic_contract_address: input.logic_contract_address.parse()?,
+            logic_contract_address: input.address.parse()?,
             payload: input.payload,
             timeout: input.timeout,
-            invalidation_id: input.invalidation_id,
+            invalidation_id: input.invalidation_scope,
             invalidation_nonce: input.invalidation_nonce,
         })
     }
@@ -58,20 +44,18 @@ pub struct LogicCallConfirmResponse {
     pub invalidation_id: Vec<u8>,
     pub invalidation_nonce: u64,
     pub ethereum_signer: EthAddress,
-    pub orchestrator: CosmosAddress,
     pub eth_signature: EthSignature,
 }
 
 impl LogicCallConfirmResponse {
     pub fn from_proto(
-        input: gravity_proto::gravity::MsgConfirmLogicCall,
+        input: gravity_proto::gravity::ContractCallTxConfirmation,
     ) -> Result<Self, GravityError> {
         Ok(LogicCallConfirmResponse {
-            invalidation_id: hex_str_to_bytes(&input.invalidation_id).unwrap(),
+            invalidation_id: input.invalidation_scope,
             invalidation_nonce: input.invalidation_nonce,
-            orchestrator: input.orchestrator.parse()?,
-            ethereum_signer: input.eth_signer.parse()?,
-            eth_signature: input.signature.parse()?,
+            ethereum_signer: input.ethereum_signer.parse()?,
+            eth_signature: EthSignature::try_from(input.signature.as_slice())?,
         })
     }
 }
@@ -81,6 +65,6 @@ impl Confirm for LogicCallConfirmResponse {
         self.ethereum_signer
     }
     fn get_signature(&self) -> EthSignature {
-        self.eth_signature.clone()
+        self.eth_signature
     }
 }

@@ -67,7 +67,6 @@ func NewConfigFromFlags() simulation.Config {
 		InitialBlockHeight: FlagInitialBlockHeightValue,
 		NumBlocks:          FlagNumBlocksValue,
 		BlockSize:          FlagBlockSizeValue,
-		ChainID:            "",
 		Lean:               FlagLeanValue,
 		Commit:             FlagCommitValue,
 		OnOperation:        FlagOnOperationValue,

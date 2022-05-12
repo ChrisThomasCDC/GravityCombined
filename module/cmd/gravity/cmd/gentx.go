@@ -13,13 +13,14 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	cfg "github.com/tendermint/tendermint/config"
 	tmos "github.com/tendermint/tendermint/libs/os"
 	tmtypes "github.com/tendermint/tendermint/types"
 
-	gravitytypes "github.com/althea-net/cosmos-gravity-bridge/module/x/gravity/types"
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/cosmos/cosmos-sdk/client/flags"
 	"github.com/cosmos/cosmos-sdk/client/tx"
@@ -30,11 +31,13 @@ import (
 	"github.com/cosmos/cosmos-sdk/types/module"
 	"github.com/cosmos/cosmos-sdk/version"
 	authclient "github.com/cosmos/cosmos-sdk/x/auth/client"
+	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	bankexported "github.com/cosmos/cosmos-sdk/x/bank/exported"
 	"github.com/cosmos/cosmos-sdk/x/genutil"
 	"github.com/cosmos/cosmos-sdk/x/genutil/types"
 	"github.com/cosmos/cosmos-sdk/x/staking/client/cli"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
+	gravitytypes "github.com/peggyjv/gravity-bridge/module/v2/x/gravity/types"
 )
 
 // GenTxCmd builds the application's gentx command.
@@ -42,19 +45,18 @@ func GenTxCmd(mbm module.BasicManager, txEncCfg client.TxEncodingConfig, genBalI
 	ipDefault, _ := server.ExternalIP()
 	fsCreateValidator, defaultsDesc := cli.CreateValidatorMsgFlagSet(ipDefault)
 
-	//nolint: exhaustivestruct
 	cmd := &cobra.Command{
-		Use:   "gentx [key_name] [amount] [eth-address] [orchestrator-address]",
+		Use:   "gentx [key_name] [amount] [eth-address] [orchestrator-address] [eth-sig]",
 		Short: "Generate a genesis tx carrying a self delegation, oracle key delegation and orchestrator key delegation",
-		Args:  cobra.ExactArgs(4),
-		Long: fmt.Sprintf(`Generate a genesis transaction that creates a validator with a self-delegation, oracle key 
-delegation and orchestrator key delegation that is signed by the key in the Keyring referenced by a given name. A node 
-ID and Bech32 consensus pubkey may optionally be provided. If they are omitted, they will be retrieved from the 
+		Args:  cobra.ExactArgs(5),
+		Long: fmt.Sprintf(`Generate a genesis transaction that creates a validator with a self-delegation, oracle key
+delegation and orchestrator key delegation that is signed by the key in the Keyring referenced by a given name. A node
+ID and Bech32 consensus pubkey may optionally be provided. If they are omitted, they will be retrieved from the
 priv_validator.json file. The following default parameters are included:
     %s
 
 Example:
-$ %s gentx my-key-name 1000000stake 0x033030FEeBd93E3178487c35A9c8cA80874353C9 cosmos1ahx7f8wyertuus9r20284ej0asrs085case3kn --home=/path/to/home/dir --keyring-backend=os --chain-id=test-chain-1 \
+$ %s gentx my-key-name 1000000stake 0x033030FEeBd93E3178487c35A9c8cA80874353C9 cosmos1ahx7f8wyertuus9r20284ej0asrs085case3kn 0x12...AF --home=/path/to/home/dir --keyring-backend=os --chain-id=test-chain-1 \
     --moniker="myvalidator" \
     --commission-max-change-rate=0.01 \
     --commission-max-rate=1.0 \
@@ -70,7 +72,7 @@ $ %s gentx my-key-name 1000000stake 0x033030FEeBd93E3178487c35A9c8cA80874353C9 c
 			if err != nil {
 				return err
 			}
-			cdc := clientCtx.JSONMarshaler
+			cdc := clientCtx.Codec
 
 			config := serverCtx.Config
 			config.SetRoot(clientCtx.HomeDir)
@@ -86,10 +88,9 @@ $ %s gentx my-key-name 1000000stake 0x033030FEeBd93E3178487c35A9c8cA80874353C9 c
 			}
 
 			// read --pubkey, if empty take it from priv_validator.json
-			if valPubKeyString, _ := cmd.Flags().GetString(cli.FlagPubKey); valPubKeyString != "" {
-				valPubKey, err = sdk.GetPubKeyFromBech32(sdk.Bech32PubKeyTypeConsPub, valPubKeyString)
-				if err != nil {
-					return errors.Wrap(err, "failed to get consensus node public key")
+			if pkStr, _ := cmd.Flags().GetString(cli.FlagPubKey); pkStr != "" {
+				if err := clientCtx.Codec.UnmarshalInterfaceJSON([]byte(pkStr), &valPubKey); err != nil {
+					return errors.Wrap(err, "failed to unmarshal validator public key")
 				}
 			}
 
@@ -117,8 +118,8 @@ $ %s gentx my-key-name 1000000stake 0x033030FEeBd93E3178487c35A9c8cA80874353C9 c
 
 			ethAddress := args[2]
 
-			if err := gravitytypes.ValidateEthAddress(ethAddress); err != nil {
-				return errors.Wrapf(err, "invalid ethereum address")
+			if !common.IsHexAddress(ethAddress) {
+				return errors.Wrapf(gravitytypes.ErrInvalid, "invalid ethereum address")
 			}
 
 			orchAddress, err := sdk.AccAddressFromBech32(args[3])
@@ -169,29 +170,35 @@ $ %s gentx my-key-name 1000000stake 0x033030FEeBd93E3178487c35A9c8cA80874353C9 c
 			createValCfg.Amount = amount
 
 			// create a 'create-validator' message
-			txBldr, msg, err := cli.BuildCreateValidatorMsg(clientCtx, createValCfg, txFactory, true)
+			_, msg, err := cli.BuildCreateValidatorMsg(clientCtx, createValCfg, txFactory, true)
 			if err != nil {
 				return errors.Wrap(err, "failed to build create-validator message")
 			}
 
-			delegateKeySetMsg := &gravitytypes.MsgSetOrchestratorAddress{
-				Validator:    sdk.ValAddress(key.GetAddress()).String(),
-				Orchestrator: orchAddress.String(),
-				EthAddress:   ethAddress,
+			ethSig, err := hexutil.Decode(args[4])
+			if err != nil {
+				return err
 			}
 
-			msgs := []sdk.Msg{msg, delegateKeySetMsg}
+			delegateGravityMsg := &gravitytypes.MsgDelegateKeys{
+				ValidatorAddress:    sdk.ValAddress(key.GetAddress()).String(),
+				OrchestratorAddress: orchAddress.String(),
+				EthereumAddress:     ethAddress,
+				EthSignature:        ethSig,
+			}
+
+			msgs := []sdk.Msg{msg, delegateGravityMsg}
 
 			if key.GetType() == keyring.TypeOffline || key.GetType() == keyring.TypeMulti {
 				cmd.PrintErrln("Offline key passed in. Use `tx sign` command to sign.")
-				return authclient.PrintUnsignedStdTx(txBldr, clientCtx, msgs)
+				return tx.GenerateTx(clientCtx, txFactory, msgs...)
 			}
 
 			// write the unsigned transaction to the buffer
 			w := bytes.NewBuffer([]byte{})
 			clientCtx = clientCtx.WithOutput(w)
 
-			if err = authclient.PrintUnsignedStdTx(txBldr, clientCtx, msgs); err != nil {
+			if err = tx.GenerateTx(clientCtx, txFactory, msgs...); err != nil {
 				return errors.Wrap(err, "failed to print unsigned std tx")
 			}
 
@@ -282,7 +289,6 @@ const flagGenTxDir = "gentx-dir"
 
 // CollectGenTxsCmd - return the cobra command to collect genesis transactions
 func CollectGenTxsCmd(genBalIterator types.GenesisBalancesIterator, defaultNodeHome string) *cobra.Command {
-	//nolint: exhaustivestruct
 	cmd := &cobra.Command{
 		Use:   "collect-gentxs",
 		Short: "Collect genesis txs and output a genesis.json file",
@@ -291,7 +297,7 @@ func CollectGenTxsCmd(genBalIterator types.GenesisBalancesIterator, defaultNodeH
 			config := serverCtx.Config
 
 			clientCtx := client.GetClientContextFromCmd(cmd)
-			cdc := clientCtx.JSONMarshaler
+			cdc := clientCtx.Codec
 
 			config.SetRoot(clientCtx.HomeDir)
 
@@ -363,7 +369,7 @@ func newPrintInfo(moniker, chainID, nodeID, genTxsDir string, appMessage json.Ra
 }
 
 // GenAppStateFromConfig gets the genesis app state from the config
-func GenAppStateFromConfig(cdc codec.JSONMarshaler, txEncodingConfig client.TxEncodingConfig,
+func GenAppStateFromConfig(cdc codec.JSONCodec, txEncodingConfig client.TxEncodingConfig,
 	config *cfg.Config, initCfg types.InitConfig, genDoc tmtypes.GenesisDoc, genBalIterator types.GenesisBalancesIterator,
 ) (appState json.RawMessage, err error) {
 
@@ -407,7 +413,7 @@ func GenAppStateFromConfig(cdc codec.JSONMarshaler, txEncodingConfig client.TxEn
 
 // CollectTxs processes and validates application's genesis Txs and returns
 // the list of appGenTxs, and persistent peers required to generate genesis.json.
-func CollectTxs(cdc codec.JSONMarshaler, txJSONDecoder sdk.TxDecoder, moniker, genTxsDir string,
+func CollectTxs(cdc codec.JSONCodec, txJSONDecoder sdk.TxDecoder, moniker, genTxsDir string,
 	genDoc tmtypes.GenesisDoc, genBalIterator types.GenesisBalancesIterator,
 ) (appGenTxs []sdk.Tx, persistentPeers string, err error) {
 	// prepare a map of all balances in genesis state to then validate
@@ -521,4 +527,33 @@ func CollectTxs(cdc codec.JSONMarshaler, txJSONDecoder sdk.TxDecoder, moniker, g
 	persistentPeers = strings.Join(addressesIPs, ",")
 
 	return appGenTxs, persistentPeers, nil
+}
+
+func validateAccountPresentInGenesis(
+	appGenesisState map[string]json.RawMessage, genBalIterator authtypes.GenesisAccountIterator,
+	addr sdk.Address, coins sdk.Coins, cdc codec.Codec,
+) error {
+
+	accountIsInGenesis := false
+
+	genBalIterator.IterateGenesisAccounts(cdc, appGenesisState,
+		func(acc authtypes.AccountI) (stop bool) {
+			accAddress := acc.GetAddress()
+
+			// ensure that account is in genesis
+			if accAddress.Equals(addr) {
+				// ensure account contains enough funds of default bond denom
+				accountIsInGenesis = true
+				return true
+			}
+
+			return false
+		},
+	)
+
+	if !accountIsInGenesis {
+		return fmt.Errorf("account %s does not have a balance in the genesis state", addr)
+	}
+
+	return nil
 }

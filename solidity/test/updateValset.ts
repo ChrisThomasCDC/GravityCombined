@@ -1,5 +1,5 @@
 import chai from "chai";
-import { ethers} from "hardhat";
+import { ethers } from "hardhat";
 import { solidity } from "ethereum-waffle";
 
 import { deployContracts } from "../test-utils";
@@ -9,10 +9,8 @@ import {
   signHash,
   examplePowers,
   ZeroAddress,
-  parseEvent
+  parseEvent,
 } from "../test-utils/pure";
-import { openStdin } from "node:process";
-import { format } from "prettier";
 
 chai.use(solidity);
 const { expect } = chai;
@@ -28,6 +26,9 @@ async function runTest(opts: {
   badReward?: boolean;
   notEnoughReward?: boolean;
   withReward?: boolean;
+  notEnoughPowerNewSet?: boolean;
+  zeroLengthValset?: boolean;
+  relayerNotSet?: boolean;
 }) {
   const signers = await ethers.getSigners();
   const gravityId = ethers.utils.formatBytes32String("foo");
@@ -35,14 +36,20 @@ async function runTest(opts: {
   // This is the power distribution on the Cosmos hub as of 7/14/2020
   let powers = examplePowers();
   let validators = signers.slice(0, powers.length);
-
   const powerThreshold = 6666;
 
   const {
     gravity,
     testERC20,
     checkpoint: deployCheckpoint
-  } = await deployContracts(gravityId, powerThreshold, validators, powers);
+  } = await deployContracts(gravityId, validators, powers,powerThreshold);
+
+  if (!opts.relayerNotSet) {
+    await gravity.grantRole(
+      await gravity.RELAYER(),
+      signers[0].address,
+    );
+  }
 
   let newPowers = examplePowers();
   newPowers[0] -= 3;
@@ -52,6 +59,13 @@ async function runTest(opts: {
   if (opts.malformedNewValset) {
     // Validators and powers array don't match
     newValidators = signers.slice(0, newPowers.length - 1);
+  } else if (opts.zeroLengthValset) {
+    newValidators = [];
+    newPowers = [];
+  } else if (opts.notEnoughPowerNewSet) {
+    for (let i in newPowers) {
+      newPowers[i] = 5;
+    }
   }
 
   let currentValsetNonce = 0;
@@ -122,31 +136,31 @@ async function runTest(opts: {
   let sigs = await signHash(validators, checkpoint);
   if (opts.badValidatorSig) {
     // Switch the first sig for the second sig to screw things up
-    sigs.v[1] = sigs.v[0];
-    sigs.r[1] = sigs.r[0];
-    sigs.s[1] = sigs.s[0];
+    sigs[1].v = sigs[0].v;
+    sigs[1].r = sigs[0].r;
+    sigs[1].s = sigs[0].s;
   }
 
   if (opts.zeroedValidatorSig) {
     // Switch the first sig for the second sig to screw things up
-    sigs.v[1] = sigs.v[0];
-    sigs.r[1] = sigs.r[0];
-    sigs.s[1] = sigs.s[0];
+    sigs[1].v = sigs[0].v;
+    sigs[1].r = sigs[0].r;
+    sigs[1].s = sigs[0].s;
     // Then zero it out to skip evaluation
-    sigs.v[1] = 0;
+    sigs[1].v = 0;
   }
 
   if (opts.notEnoughPower) {
     // zero out enough signatures that we dip below the threshold
-    sigs.v[1] = 0;
-    sigs.v[2] = 0;
-    sigs.v[3] = 0;
-    sigs.v[5] = 0;
-    sigs.v[6] = 0;
-    sigs.v[7] = 0;
-    sigs.v[9] = 0;
-    sigs.v[11] = 0;
-    sigs.v[13] = 0;
+    sigs[1].v = 0;
+    sigs[2].v = 0;
+    sigs[3].v = 0;
+    sigs[5].v = 0;
+    sigs[6].v = 0;
+    sigs[7].v = 0;
+    sigs[9].v = 0;
+    sigs[11].v = 0;
+    sigs[13].v = 0;
   }
 
   if (opts.malformedCurrentValset) {
@@ -158,22 +172,20 @@ async function runTest(opts: {
   let valsetUpdateTx = await gravity.updateValset(
     newValset,
     currentValset,
-    sigs.v,
-    sigs.r,
-    sigs.s
+    sigs
   );
-  
+
   // check that the relayer was paid
   if (opts.withReward) {
     // panic if we failed to deploy the contract earlier
     expect(ERC20contract)
     if (ERC20contract) {
-        expect(
-          await (
-            await ERC20contract.functions.balanceOf(await valsetUpdateTx.from)
-          )[0].toNumber()
-        ).to.equal(5000000);
-      }
+      expect(
+        await (
+          await ERC20contract.functions.balanceOf(await valsetUpdateTx.from)
+        )[0].toNumber()
+      ).to.equal(5000000);
+    }
   }
 
   return { gravity, checkpoint };
@@ -182,13 +194,19 @@ async function runTest(opts: {
 describe("updateValset tests", function () {
   it("throws on malformed new valset", async function () {
     await expect(runTest({ malformedNewValset: true })).to.be.revertedWith(
-      "Malformed new validator set"
+      "MalformedNewValidatorSet()"
+    );
+  });
+
+  it("throws on empty new valset", async function () {
+    await expect(runTest({ zeroLengthValset: true })).to.be.revertedWith(
+      "MalformedNewValidatorSet()"
     );
   });
 
   it("throws on malformed current valset", async function () {
     await expect(runTest({ malformedCurrentValset: true })).to.be.revertedWith(
-      "Malformed current validator set"
+      "MalformedCurrentValidatorSet()"
     );
   });
 
@@ -196,19 +214,19 @@ describe("updateValset tests", function () {
     await expect(
       runTest({ nonMatchingCurrentValset: true })
     ).to.be.revertedWith(
-      "Supplied current validators and powers do not match checkpoint"
+      "IncorrectCheckpoint()"
     );
   });
 
   it("throws on new valset nonce not incremented", async function () {
     await expect(runTest({ nonceNotIncremented: true })).to.be.revertedWith(
-      "New valset nonce must be greater than the current nonce"
+      "InvalidValsetNonce(0, 0)"
     );
   });
 
   it("throws on bad validator sig", async function () {
     await expect(runTest({ badValidatorSig: true })).to.be.revertedWith(
-      "Validator signature does not match"
+      "InvalidSignature()"
     );
   });
 
@@ -218,7 +236,13 @@ describe("updateValset tests", function () {
 
   it("throws on not enough signatures", async function () {
     await expect(runTest({ notEnoughPower: true })).to.be.revertedWith(
-      "Submitted validator set signatures do not have enough power"
+      "InsufficientPower(6537, 6666)"
+    );
+  });
+
+  it("throws on not enough power in new set", async function () {
+    await expect(runTest({ notEnoughPowerNewSet: true })).to.be.revertedWith(
+      "InsufficientPower(625, 6666)"
     );
   });
 
@@ -235,9 +259,18 @@ describe("updateValset tests", function () {
   });
 
   it("pays reward correctly", async function () {
-    let {gravity, checkpoint} = await runTest({ withReward: true });
+    let { gravity, checkpoint } = await runTest({ withReward: true });
     expect((await gravity.functions.state_lastValsetCheckpoint())[0]).to.equal(checkpoint);
   });
+
+  it("throws on relayer not set", async function () {
+    const relayerHash = "0xab4f864e5201b0fde9b5ee3e4cf96384802b0ffdfcf7f9de4699ce21a30afc4f" // keccak256("RELAYER")
+    const signers = await ethers.getSigners();
+    await expect(runTest({ relayerNotSet: true })).to.be.revertedWith(
+        `AccessControl: account ${signers[0].address.toLowerCase()} is missing role ${relayerHash}`
+    );
+  });
+
 
   it("happy path", async function () {
     let { gravity, checkpoint } = await runTest({});
@@ -258,10 +291,10 @@ describe("updateValset Go test hash", function () {
     // note these are manually sorted, functions in Go and Rust auto-sort
     // but this does not so be aware of the order!
     const validators = ["0xE5904695748fe4A84b40b3fc79De2277660BD1D3",
-                        "0xc783df8a850f42e7F7e57013759C285caa701eB6", 
-                        "0xeAD9C93b79Ae7C1591b1FB5323BD777E86e150d4", 
-                        ];
-    const powers = [3333,3333,3333];
+      "0xc783df8a850f42e7F7e57013759C285caa701eB6",
+      "0xeAD9C93b79Ae7C1591b1FB5323BD777E86e150d4",
+    ];
+    const powers = [1431655765, 1431655765, 1431655765];
 
 
 
@@ -319,4 +352,5 @@ describe("updateValset Go test hash", function () {
     })
     console.log("abiEncodedValset:", abiEncodedValset)
     console.log("valsetDigest:", valsetDigest)
-})});
+  })
+});

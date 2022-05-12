@@ -1,15 +1,16 @@
 use super::*;
-use crate::error::GravityError;
-use clarity::constants::ZERO_ADDRESS;
-use clarity::Address as EthAddress;
-use clarity::Signature as EthSignature;
+use crate::{
+    error::GravityError,
+    ethereum::{format_eth_address, u8_slice_to_fixed_32},
+};
 use deep_space::error::CosmosGrpcError;
-use deep_space::Address as CosmosAddress;
+use ethers::types::{Address as EthAddress, Signature as EthSignature};
+use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    fmt,
+    fmt, str,
 };
 
 /// The total power in the Gravity bridge is normalized to u32 max every
@@ -46,37 +47,37 @@ struct SignatureStatus {
     number_of_unset_key_validators: usize,
     power_of_nonvoters: u64,
     number_of_nonvoters: usize,
+    power_of_invalid_signers: u64,
+    number_of_invalid_signers: usize,
     num_validators: usize,
 }
 
 /// the response we get when querying for a valset confirmation
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ValsetConfirmResponse {
-    pub orchestrator: CosmosAddress,
-    pub eth_address: EthAddress,
+    pub eth_signer: EthAddress,
     pub nonce: u64,
     pub eth_signature: EthSignature,
 }
 
 impl ValsetConfirmResponse {
     pub fn from_proto(
-        input: gravity_proto::gravity::MsgValsetConfirm,
+        input: gravity_proto::gravity::SignerSetTxConfirmation,
     ) -> Result<Self, GravityError> {
         Ok(ValsetConfirmResponse {
-            orchestrator: input.orchestrator.parse()?,
-            eth_address: input.eth_address.parse()?,
-            nonce: input.nonce,
-            eth_signature: input.signature.parse()?,
+            eth_signer: input.ethereum_signer.parse()?,
+            nonce: input.signer_set_nonce,
+            eth_signature: EthSignature::try_from(input.signature.as_slice())?,
         })
     }
 }
 
 impl Confirm for ValsetConfirmResponse {
     fn get_eth_address(&self) -> EthAddress {
-        self.eth_address
+        self.eth_signer
     }
     fn get_signature(&self) -> EthSignature {
-        self.eth_signature.clone()
+        self.eth_signature
     }
 }
 
@@ -85,8 +86,6 @@ impl Confirm for ValsetConfirmResponse {
 pub struct Valset {
     pub nonce: u64,
     pub members: Vec<ValsetMember>,
-    pub reward_amount: Uint256,
-    pub reward_token: Option<EthAddress>,
 }
 
 impl Valset {
@@ -103,7 +102,7 @@ impl Valset {
                     powers.push(val.power);
                 }
                 None => {
-                    addresses.push(EthAddress::default());
+                    addresses.push(EthAddress::zero());
                     powers.push(val.power);
                 }
             }
@@ -145,29 +144,32 @@ impl Valset {
         let mut number_of_unset_key_validators = 0;
         let mut power_of_nonvoters = 0;
         let mut number_of_nonvoters = 0;
+        let mut power_of_invalid_signers = 0;
+        let mut number_of_invalid_signers = 0;
         for member in self.members.iter() {
             if let Some(eth_address) = member.eth_address {
                 if let Some(sig) = signatures_hashmap.get(&eth_address) {
-                    assert_eq!(sig.get_eth_address(), eth_address);
-                    assert!(sig.get_signature().is_valid());
-                    let recover_key = sig.get_signature().recover(signed_message).unwrap();
+                    let sig_hash = u8_slice_to_fixed_32(signed_message)?;
+                    let recover_key = sig.get_signature().recover(sig_hash)?;
                     if recover_key == sig.get_eth_address() {
                         out.push(GravitySignature {
                             power: member.power,
                             eth_address: sig.get_eth_address(),
-                            v: sig.get_signature().v.clone(),
-                            r: sig.get_signature().r.clone(),
-                            s: sig.get_signature().s.clone(),
+                            v: sig.get_signature().v,
+                            r: sig.get_signature().r,
+                            s: sig.get_signature().s,
                         });
                         power_of_good_sigs += member.power;
                     } else {
-                        // the go code verifies signatures, if we ever see this it means
-                        // that something has gone horribly wrong with our parsing or ordering
-                        // in the orchestrator, therefore we panic.
-                        panic!(
-                            "Found invalid signature for {} how did this get here?",
-                            sig.get_eth_address()
-                        )
+                        out.push(GravitySignature {
+                            power: member.power,
+                            eth_address,
+                            v: 0u8.into(),
+                            r: 0u8.into(),
+                            s: 0u8.into(),
+                        });
+                        power_of_invalid_signers += member.power;
+                        number_of_invalid_signers += 1;
                     }
                 } else {
                     out.push(GravitySignature {
@@ -201,6 +203,8 @@ impl Valset {
             power_of_unset_keys,
             num_validators,
             number_of_nonvoters,
+            power_of_invalid_signers,
+            number_of_invalid_signers,
             number_of_unset_key_validators,
         })
     }
@@ -220,6 +224,7 @@ impl Valset {
                 has {}/{} or {:.2}% power voting! Can not execute on Ethereum!
                 {}/{} validators have unset Ethereum keys representing {}/{} or {:.2}% of the power required
                 {}/{} validators have Ethereum keys set but have not voted representing {}/{} or {:.2}% of the power required
+                {}/{} validators have Invalid signatures {}/{} or {:.2}% of the power required
                 This valset probably just needs to accumulate signatures for a moment.",
                 status.power_of_good_sigs,
                 TOTAL_GRAVITY_POWER,
@@ -234,6 +239,11 @@ impl Valset {
                 status.power_of_nonvoters,
                 TOTAL_GRAVITY_POWER,
                 gravity_power_to_percent(status.power_of_nonvoters),
+                status.number_of_invalid_signers,
+                status.num_validators,
+                status.power_of_invalid_signers,
+                TOTAL_GRAVITY_POWER,
+                gravity_power_to_percent(status.power_of_invalid_signers),
             );
             Err(GravityError::InsufficientVotingPowerToPass(message))
         } else {
@@ -266,73 +276,44 @@ impl Valset {
         }
         res
     }
+}
 
-    /// This function takes the current valset and compares it to a provided one
-    /// returning a percentage difference in their power allocation. This is a very
-    /// important function as it's used to decide when the validator sets are updated
-    /// on the Ethereum chain and when new validator sets are requested on the Cosmos
-    /// side. In theory an error here, if unnoticed for long enough, could allow funds
-    /// to be stolen from the bridge without the validators in question still having stake
-    /// to lose.
-    /// Returned value must be less than or equal to two
-    pub fn power_diff(&self, other: &Valset) -> f32 {
-        let mut total_power_diff = 0u64;
-        let a = self.to_hashmap();
-        let b = other.to_hashmap();
-        let a_map = self.to_hashset();
-        let b_map = other.to_hashset();
-        // items in A and B, we go through these and compute the absolute value of the
-        // difference in power and sum it.
-        let intersection = a_map.intersection(&b_map);
-        // items in A but not in B or vice versa, since we're just trying to compute the difference
-        // we can simply sum all of these up.
-        let symmetric_difference = a_map.symmetric_difference(&b_map);
-        for item in symmetric_difference {
-            let mut power = None;
-            if let Some(val) = a.get(item) {
-                power = Some(val);
-            } else if let Some(val) = b.get(item) {
-                power = Some(val);
-            }
-            // impossible for this to panic without a failure in the logic
-            // of the symmetric difference function
-            let power = power.unwrap();
-            total_power_diff += power;
+impl From<gravity_proto::gravity::SignerSetTxResponse> for Valset {
+    fn from(input: gravity_proto::gravity::SignerSetTxResponse) -> Self {
+        Valset {
+            nonce: input.signer_set.clone().unwrap().nonce,
+            members: input
+                .signer_set
+                .unwrap()
+                .signers
+                .iter()
+                .map(|i| i.into())
+                .collect(),
         }
-        for item in intersection {
-            // can't panic since there must be an entry for both.
-            let power_a = a[item];
-            let power_b = b[item];
-            if power_a > power_b {
-                total_power_diff += power_a - power_b;
-            } else {
-                total_power_diff += power_b - power_a;
-            }
-        }
-
-        (total_power_diff as f32) / (u32::MAX as f32)
     }
 }
 
-impl From<gravity_proto::gravity::Valset> for Valset {
-    fn from(input: gravity_proto::gravity::Valset) -> Self {
-        (&input).into()
-    }
-}
-
-impl From<&gravity_proto::gravity::Valset> for Valset {
-    fn from(input: &gravity_proto::gravity::Valset) -> Self {
-        let parsed_reward_token = input.reward_token.parse().unwrap();
-        let reward_token = if parsed_reward_token == *ZERO_ADDRESS {
-            None
-        } else {
-            Some(parsed_reward_token)
-        };
+impl From<gravity_proto::gravity::SignerSetTx> for Valset {
+    fn from(input: gravity_proto::gravity::SignerSetTx) -> Self {
         Valset {
             nonce: input.nonce,
-            members: input.members.iter().map(|i| i.into()).collect(),
-            reward_amount: input.reward_amount.parse().unwrap(),
-            reward_token,
+            members: input.signers.iter().map(|i| i.into()).collect(),
+        }
+    }
+}
+
+impl From<&gravity_proto::gravity::SignerSetTxResponse> for Valset {
+    fn from(input: &gravity_proto::gravity::SignerSetTxResponse) -> Self {
+        Valset {
+            nonce: input.signer_set.clone().unwrap().nonce,
+            members: input
+                .signer_set
+                .clone()
+                .unwrap()
+                .signers
+                .iter()
+                .map(|i| i.into())
+                .collect(),
         }
     }
 }
@@ -382,45 +363,50 @@ impl ValsetMember {
 impl fmt::Display for ValsetMember {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.eth_address {
-            Some(a) => write!(f, "Address: {} Power: {}", a, self.power),
+            Some(a) => write!(
+                f,
+                "Address: {} Power: {}",
+                format_eth_address(a),
+                self.power
+            ),
             None => write!(f, "Address: None Power: {}", self.power),
         }
     }
 }
 
-impl From<gravity_proto::gravity::BridgeValidator> for ValsetMember {
-    fn from(input: gravity_proto::gravity::BridgeValidator) -> Self {
+impl From<gravity_proto::gravity::EthereumSigner> for ValsetMember {
+    fn from(input: gravity_proto::gravity::EthereumSigner) -> Self {
         let eth_address = match input.ethereum_address.parse() {
             Ok(e) => Some(e),
             Err(_) => None,
         };
         ValsetMember {
-            power: input.power,
+            power: input.power as u64,
             eth_address,
         }
     }
 }
 
-impl From<&gravity_proto::gravity::BridgeValidator> for ValsetMember {
-    fn from(input: &gravity_proto::gravity::BridgeValidator) -> Self {
+impl From<&gravity_proto::gravity::EthereumSigner> for ValsetMember {
+    fn from(input: &gravity_proto::gravity::EthereumSigner) -> Self {
         let eth_address = match input.ethereum_address.parse() {
             Ok(e) => Some(e),
             Err(_) => None,
         };
         ValsetMember {
-            power: input.power,
+            power: input.power as u64,
             eth_address,
         }
     }
 }
 
-impl From<&ValsetMember> for gravity_proto::gravity::BridgeValidator {
-    fn from(input: &ValsetMember) -> gravity_proto::gravity::BridgeValidator {
+impl From<&ValsetMember> for gravity_proto::gravity::EthereumSigner {
+    fn from(input: &ValsetMember) -> gravity_proto::gravity::EthereumSigner {
         let ethereum_address = match input.eth_address {
-            Some(e) => e.to_string(),
+            Some(e) => format_eth_address(e),
             None => String::new(),
         };
-        gravity_proto::gravity::BridgeValidator {
+        gravity_proto::gravity::EthereumSigner {
             power: input.power,
             ethereum_address,
         }

@@ -22,11 +22,11 @@ Finally we perform the last step of this process in the Orchestrator [send_ether
 
 From here we step into the Go codebase where you'll find claim message types in [msgs.go](/module/x/gravity/types/msgs.go) and [msg_server.go](/module/x/gravity/keeper/msg_server.go) But these only add the claim to the store after checking validity.
 
-Claims are added to the store with a function called [Attest](/module/x/gravity/keeper/attestation.go). This only checks that the submission is valid and stores the submission. This either creates or adds to an `Attestation`. You can think of the `Attestation` as 'a potential event that might have happened' whereas a `claim` is simply something that one validator said. Multiple `claims` are aggregated into a single `Attestation` if they are making the same `claim`. For example that event nonce 50 is a deposit to address x for value y.
+Claims are added to the store with a method called [recordEventVote](/module/x/gravity/keeper/ethereum_event_handler.go). This only checks that the submission is valid and stores the submission. This either creates or adds to an `EthereumEventVoteRecord`. You can think of the `EthereumEventVoteRecord` as 'a potential event that might have happened' whereas a `event` is simply something that one validator said. Multiple `events` are aggregated into a single `EthereumEventVoteRecord` if they are making the same `event`. For example that event nonce 50 is a deposit to address x for value y.
 
-At the end of every block the [EndBlocker](/module/x/gravity/abci.go) runs. In it the function [attestationTally](/module/x/gravity/abci.go) we loop overall `Attestations` and call [TryAttestation](/module/x/gravity/keeper/attestation.go). This function loops over every `claim` and determines if the validators making these claims sum to greater than 66% of the current voting power. If that's the case the `Attestation` is executed by the [AttestationHandler](/module/x/gravity/keeper/attestation_handler.go).
+At the end of every block the [EndBlocker](/module/x/gravity/abci.go) runs. In it the function [eventVoteRecordTally](/module/x/gravity/abci.go) we loop overall `EventVoteRecords` and call [TryEventVoteRecord](/module/x/gravity/keeper/ethereum_event_vote.go). This function loops over every `event` and determines if the validators making these claims sum to greater than 66% of the current voting power. If that's the case the `EthereumEventVoteRecord` is executed by the [EthereumEventProcessor](/module/x/gravity/keeper/attestation_handler.go).
 
-The [AttestationHandler](/module/x/gravity/keeper/attestation_handler.go) contains a case for every possible state change required by the oracle and mints, burns, or processes an event as required. In this case we only care about MsgSendToCosmosClaim.
+The [EthereumEventProcessor](/module/x/gravity/keeper/ethereum_event_processor.go) contains a case for every possible state change required by the oracle and mints, burns, or processes an event as required. In this case we only care about MsgSendToCosmosClaim.
 
 Here we determine if the deposited coin is Cosmos Originated, at which point we should unlock the Cosmos token we locked into the bank module and send it to the user. If it is Ethereum originated we mint and issue to the user a representative token.
 
@@ -34,7 +34,7 @@ Here we determine if the deposited coin is Cosmos Originated, at which point we 
 
 This covers the complete flow, including code links, for a withdraw. This is covered conceptually in [minting and locking](/docs/design/mint-lock.md), [Ethereum signing](/docs/design/ethereum-signing.md), and [batch creation spec](/spec/batch-creation-spec.md) which you should read first.
 
-First a user on the Cosmos chain calls [MsgSendToEth](/module/proto/gravity/v1/msgs.proto). This message will contain two fees. One fee for the Cosmos transaction, and another fee for the bridge.
+First a user on the Cosmos chain calls [MsgSendToEthereum](/module/proto/gravity/v1/msgs.proto). This message will contain two fees. One fee for the Cosmos transaction, and another fee for the bridge. The `DenomToERC20Lookup` function ensures that asset has a registered Erc20 contract either from previously going through the deploy to Erc20 contract flow or because the asset originated on the Ethereum chain.
 
 By the time we handle the send in [msg_server.go](/module/x/gravity/keeper/msg_server.go) the Cosmos chain tx fee has already been handled. [ValidateBasic](/module/x/gravity/types/msgs.go) verifies that the bridge fee is the same as the bridge asset being sent to Ethereum. As covered in [minting and locking](/docs/design/mint-lock.md) this is so that the relayers can be rewarded on the Ethereum side of the bridge.
 
@@ -42,28 +42,28 @@ Once the message has passed basic verification it moves into the TxPool [AddToOu
 
 As covered in the [batch creation spec](/spec/batch-creation-spec.md) transactions will wait in this pool until one of two things happens.
 
-The user may call [MsgCancelSendToEth](/module/proto/gravity/v1/msgs.proto) which will remove the transaction from the pool and refund the user. In [msg_server.go](/module/x/gravity/keeper/msg_server.go) we call [RemoveFromOutgoingPoolAndRefund](/module/x/gravity/keeper/pool.go).
+The user may call [CancelSendToEthereum](/module/proto/gravity/v1/msgs.proto) which will remove the transaction from the pool and refund the user. In [msg_server.go](/module/x/gravity/keeper/msg_server.go) we call [cancelSendToEthereum](/module/x/gravity/keeper/pool.go).
 
-Alternatively a relayer using the [BatchFees](/module/proto/gravity/v1/query.proto) query endpoint may decide to call [MsgRequestBatch](/module/proto/gravity/v1/msgs.proto). Note automatic execution of request batch is not currently implemented and is in issue #305
+Alternatively a relayer using the [BatchTxFees](/module/proto/gravity/v1/query.proto) query endpoint may decide to call [MsgRequestBatchTx](/module/proto/gravity/v1/msgs.proto). Note automatic execution of request batch is not currently implemented and is in issue #305
 
-RequestBatch in [msg_server.go](/module/x/gravity/keeper/msg_server.go) calls [BuildOutgoingTXBatch](/module/x/gravity/keeper/batch.go) which implements the protocol defined in the [batch creation spec](/spec/batch-creation-spec.md). Creating a batch of up to `OutgoingTxBatchSize` number of withdraws in order of descending fee amounts.
+RequestBatchTx in [msg_server.go](/module/x/gravity/keeper/msg_server.go) calls [BuildBatchTx](/module/x/gravity/keeper/batch.go) which implements the protocol defined in the [batch creation spec](/spec/batch-creation-spec.md). Creating a batch of up to `100` withdraws in order of descending fee amounts.
 
-Now the resulting batch is made available to [Ethereum signers](/docs/design/ethereum-signing.md) via the [LastPendingBatchRequestByAddr](/module/proto/gravity/v1/query.proto) endpoint. The [LastPendingBatchRequestsByAddr](/module/x/gravity/keeper/grpc_query.go) endpoint looks up for the Ethereum signer what batches it has not yet signed that it must sign to avoid slashing see [slashing spec](/spec/slashing-spec.md).
+Now the resulting batch is made available to [Ethereum signers](/docs/design/ethereum-signing.md) via the [UnsignedSignerSetTxsRequest](/module/proto/gravity/v1/query.proto) endpoint. The [UnsignedSignerSetTxs](/module/x/gravity/keeper/grpc_query.go) endpoint looks up for the Ethereum signer what batches it has not yet signed that it must sign to avoid slashing see [slashing spec](/spec/slashing-spec.md).
 
-The [eth_signer_main_loop](/orchestrator/orchestrator/src/main_loop.rs) essentially just queries three of these endpoints (one for each type of signature) and submits signatures via [MsgConfirmBatch](/module/proto/gravity/v1/msgs.proto). Which is handled in [msg_server.go](/module/x/gravity/keeper/msg_server.go).
+The [eth_signer_main_loop](/orchestrator/orchestrator/src/main_loop.rs) essentially just queries three of these endpoints (one for each type of signature) and submits signatures via [MsgSubmitEthereumTxConfirmation](/module/proto/gravity/v1/msgs.proto). Which is handled in [msg_server.go](/module/x/gravity/keeper/msg_server.go).
 
-The MsgConfirmBatch handler loads the tx batch and verifies that the Ethereum signature is from the correct address, over the correct batch, and not already submitted in `confirmHandlerCommon` (also in msg_server.go).
+The MsgSubmitEthereumTxConfirmation handler loads the tx batch and verifies that the Ethereum signature is from the correct address, over the correct batch, and not already submitted.
 
 At this point the batch is ready to execute and any relayer may relay it to Ethereum.
 
-In the [relayer_main_loop](/orchestrator/relayer/src/main_loop.rs) the query endpoint [OutgoingTxBatches](/module/proto/gravity/v1/query.proto) implemented in [grpc_query.go](/module/x/gravity/keeper/grpc_query.go) lists the last 100 outgoing tx batches. The relayer then calls [BatchConfirms](/module/proto/gravity/v1/query.proto) which returns all the signatures for the given batch.
+In the [relayer_main_loop](/orchestrator/relayer/src/main_loop.rs) the query endpoint [UnsignedBatchTxsRequest](/module/proto/gravity/v1/query.proto) and [UnsignedContractCallTxsRequest](/module/proto/gravity/v1/query.proto) implemented in [grpc_query.go](/module/x/gravity/keeper/grpc_query.go) lists the last 100 outgoing tx batches. The relayer then calls [BatchTxConfirmationsRequest](/module/proto/gravity/v1/query.proto) and [ContractCallTxConfirmationsRequest](/module/proto/gravity/v1/query.proto) which returns all the signatures for the given batch.
 
 Now the challenge is to take these signatures and prepare them for submission to Ethereum. This is a non-trivial task.
 See [relaying semantics doc](/docs/design/relaying-semantics.md).
 
 [get_batches_and_signatures](/orchestrator/relayer/src/batch_relaying.rs) calls a function [order_sigs](/orchestrator/gravity_utils/src/types/valsets.rs) which takes the latest validator set on Ethereum as well as the array of signatures and prepares them for submission.
 
-All power in [gravity.sol](/solidity/contracts/Gravity.sol) is normalized such that total voting power is `2^64`, this allows `order_sigs` to determine if enough voting power has voted for a given batch to be valid. This local simulation approach helps debug problems and is much faster than simply trying to simulate the transaction using the Ethereum RPC.
+All power in [gravity.sol](/solidity/contracts/Gravity.sol) is normalized such that total voting power is `2^32`, this allows `order_sigs` to determine if enough voting power has voted for a given batch to be valid. This local simulation approach helps debug problems and is much faster than simply trying to simulate the transaction using the Ethereum RPC.
 
 Finally [should_relay_batch](/orchestrator/relayer/src/batch_relaying.rs) is called. This takes the batch + signatures confirmed in the previous step and simulates it's ETH cost to execute and compares that value to the value of the reward on UniswapV3. If the relayer would lose money relaying the batch it does not do so.
 
@@ -73,7 +73,7 @@ Once all these steps and checks have been passed [send_eth_transaction_batch](/o
 
 this event is then parsed by the `eth_oracle_main_loop` and the rest of the oracle procedure has been documented in [Deposit from Ethereum To Cosmos](#deposit-from-ethereum-to-cosmos)
 
-Picking back up at the [AttestationHandler](/module/x/gravity/keeper/attestation_handler.go) the case for a `MsgBatchSendToEthClaim` calls [OutgoingTxBatchExecuted](/module/x/gravity/keeper/batch.go). This purges batches that can no longer execute (lower nonce than the batch that has executed) and frees their transactions for the creation of new batches or `MsgCancelSendToEth` according to the [batch creation spec](/spec/batch-creation-spec.md)
+Picking back up at the [EthereumEventHandler](/module/x/gravity/keeper/ethereum_event_handler.go) the case for a `BatchExecutedEvent` calls [batchTxExecuted](/module/x/gravity/keeper/batch.go). This purges batches that can no longer execute (lower nonce than the batch that has executed) and frees their transactions for the creation of new batches or `MsgCancelSendToEthereum` according to the [batch creation spec](/spec/batch-creation-spec.md)
 
 ## Validator Set Update
 
@@ -99,10 +99,12 @@ this event is then parsed by the `eth_oracle_main_loop` and the rest of the orac
 
 Picking back up at the [AttestationHandler](/module/x/gravity/keeper/attestation_handler.go) the case for ValsetUpdatedEvents is used to progress batch timeouts where required, and valset pruning.
 
-## Validator Set Rewards
-
-TODO
-
 ## ERC20 representation deployment
 
-TODO
+Assets that orginate on the Cosmos chain can be transfered to the Ethereum by instatiating an ERC-20 respresentation of the asset where the ERC20 contract is controlled by the bridge.
+
+The [gravity.sol](/solidity/contracts/Gravity.sol)  function must invoked by some user ahead of sending a Cosmos originated token. 
+
+Calling this function will emit a `ERC20DeployedEvent` which will be picked up by each validator's orchestrator. Each of these orachestors will send a `MsgSubmitEthereumEvent` with `ERC20DeployedEvent` payload to the Cosmos chain. Once 2/3+1 of the voting power has recognized submitted the event. The [EthereumEventProcessor](/module/x/gravity/keeper/ethereum_event_handler) calls `verifyERC20DeployedEvent` and verifes that the deployed erc20 contract matches the onchain metadata of an existing asset on chain and then registers the deployed contract from future SendToEthereum calls for that asset.
+
+

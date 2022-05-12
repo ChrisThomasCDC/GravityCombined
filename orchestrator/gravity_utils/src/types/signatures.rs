@@ -1,7 +1,8 @@
-use clarity::Signature as EthSignature;
-use clarity::{abi::Token, Address as EthAddress};
-use num256::Uint256;
+use ethers::prelude::*;
+use ethers::types::{Address as EthAddress, Signature as EthSignature};
+use gravity_abi::gravity::ValSignature;
 use std::cmp::Ordering;
+use std::convert::TryFrom;
 
 /// A sortable struct of a validator and it's signatures
 /// this can be used for either transaction batch or validator
@@ -10,9 +11,19 @@ use std::cmp::Ordering;
 pub struct GravitySignature {
     pub power: u64,
     pub eth_address: EthAddress,
-    pub v: Uint256,
-    pub r: Uint256,
-    pub s: Uint256,
+    pub v: u64,
+    pub r: U256,
+    pub s: U256,
+}
+
+impl GravitySignature {
+    pub fn to_val_sig(&self) -> ValSignature {
+        ValSignature {
+            v: self.v as u8,
+            r: self.r.into(),
+            s: self.s.into(),
+        }
+    }
 }
 
 impl Ord for GravitySignature {
@@ -44,37 +55,37 @@ impl PartialOrd for GravitySignature {
 pub struct GravitySignatureArrays {
     pub addresses: Vec<EthAddress>,
     pub powers: Vec<u64>,
-    pub v: Token,
-    pub r: Token,
-    pub s: Token,
+    pub v: Vec<u8>,
+    pub r: Vec<[u8; 32]>,
+    pub s: Vec<[u8; 32]>,
 }
 
 /// This function handles converting the GravitySignature type into an Ethereum
 /// submittable arrays, including the finicky token encoding tricks you need to
 /// perform in order to distinguish between a uint8[] and bytes32[]
 pub fn to_arrays(input: Vec<GravitySignature>) -> GravitySignatureArrays {
-    let mut addresses = Vec::new();
-    let mut powers = Vec::new();
-    let mut v = Vec::new();
-    let mut r = Vec::new();
-    let mut s = Vec::new();
-    for val in input {
-        addresses.push(val.eth_address);
-        powers.push(val.power);
-        v.push(val.v);
-        r.push(val.r);
-        s.push(val.s);
-    }
+    let addresses = input.iter().map(|sig| sig.eth_address).collect();
+    let powers = input.iter().map(|sig| sig.power).collect();
+    // TODO(bolten): we're also throwing panics if we encounter downcast errors in
+    // ethereum_gravity/src/utils.rs, we should consider broadly how to handle
+    // these sorts of error conditions
+    let v = input
+        .iter()
+        .map(|sig| u8::try_from(sig.v).expect("Gravity Signature v overflow! Bridge halt!"))
+        .collect();
+    let r = input.iter().map(|sig| sig.r.into()).collect();
+    let s = input.iter().map(|sig| sig.s.into()).collect();
+
     GravitySignatureArrays {
         addresses,
         powers,
-        v: v.into(),
-        r: r.into(),
-        s: s.into(),
+        v,
+        r,
+        s,
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone, Eq, PartialEq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 pub struct SigWithAddress {
     pub eth_address: EthAddress,
     pub eth_signature: EthSignature,
@@ -94,7 +105,7 @@ mod tests {
                 eth_address: "0x479FFc856Cdfa0f5D1AE6Fa61915b01351A7773D"
                     .parse()
                     .unwrap(),
-                v: 0u64.into(),
+                v: 0u64,
                 r: 0u64.into(),
                 s: 0u64.into(),
             },
@@ -103,7 +114,7 @@ mod tests {
                 eth_address: "0x6db48cBBCeD754bDc760720e38E456144e83269b"
                     .parse()
                     .unwrap(),
-                v: 0u64.into(),
+                v: 0u64,
                 r: 0u64.into(),
                 s: 0u64.into(),
             },
@@ -112,7 +123,7 @@ mod tests {
                 eth_address: "0x0A7254b318dd742A3086882321C27779B4B642a6"
                     .parse()
                     .unwrap(),
-                v: 0u64.into(),
+                v: 0u64,
                 r: 0u64.into(),
                 s: 0u64.into(),
             },
@@ -121,7 +132,7 @@ mod tests {
                 eth_address: "0x454330deAaB759468065d08F2b3B0562caBe1dD1"
                     .parse()
                     .unwrap(),
-                v: 0u64.into(),
+                v: 0u64,
                 r: 0u64.into(),
                 s: 0u64.into(),
             },
@@ -130,7 +141,7 @@ mod tests {
                 eth_address: "0x8E91960d704Df3fF24ECAb78AB9df1B5D9144140"
                     .parse()
                     .unwrap(),
-                v: 0u64.into(),
+                v: 0u64,
                 r: 0u64.into(),
                 s: 0u64.into(),
             },
@@ -139,7 +150,7 @@ mod tests {
                 eth_address: "0x3511A211A6759d48d107898302042d1301187BA9"
                     .parse()
                     .unwrap(),
-                v: 0u64.into(),
+                v: 0u64,
                 r: 0u64.into(),
                 s: 0u64.into(),
             },
@@ -148,7 +159,7 @@ mod tests {
                 eth_address: "0xF14879a175A2F1cEFC7c616f35b6d9c2b0Fd8326"
                     .parse()
                     .unwrap(),
-                v: 0u64.into(),
+                v: 0u64,
                 r: 0u64.into(),
                 s: 0u64.into(),
             },
@@ -157,7 +168,7 @@ mod tests {
                 eth_address: "0x37A0603dA2ff6377E5C7f75698dabA8EE4Ba97B8"
                     .parse()
                     .unwrap(),
-                v: 0u64.into(),
+                v: 0u64,
                 r: 0u64.into(),
                 s: 0u64.into(),
             },

@@ -9,7 +9,7 @@ import {
   getSignerAddresses,
   signHash,
   examplePowers,
-  ZeroAddress
+  ZeroAddress,
 } from "../test-utils/pure";
 
 chai.use(solidity);
@@ -29,6 +29,9 @@ async function runTest(opts: {
   barelyEnoughPower?: boolean;
   malformedCurrentValset?: boolean;
   timedOut?: boolean;
+
+  // Issue with relayer permissions
+  relayerNotSet?: boolean;
 }) {
 
 
@@ -45,7 +48,14 @@ async function runTest(opts: {
     gravity,
     testERC20,
     checkpoint: deployCheckpoint
-  } = await deployContracts(gravityId,  powerThreshold, validators, powers);
+  } = await deployContracts(gravityId, validators, powers, powerThreshold);
+
+  if (!opts.relayerNotSet) {
+    await gravity.grantRole(
+      await gravity.RELAYER(),
+      signers[0].address,
+    );
+  }
 
   // First we deploy the logic batch middleware contract. This makes it easy to call a logic 
   // contract a bunch of times in a batch.
@@ -64,9 +74,9 @@ async function runTest(opts: {
   // Transfer out to Cosmos, locking coins
   // =====================================
   await testERC20.functions.approve(gravity.address, 1000);
-  await gravity.functions.sendToCosmos(
+  await gravity.functions.sendToCronos(
     testERC20.address,
-    ethers.utils.formatBytes32String("myCosmosAddress"),
+    "0xffffffffffffffffffffffffffffffffffffffff",
     1000
   );
 
@@ -122,7 +132,6 @@ async function runTest(opts: {
     invalidationNonce: invalidationNonce // invalidationNonce
   }
 
-
   const digest = ethers.utils.keccak256(ethers.utils.defaultAbiCoder.encode(
     [
       "bytes32", // gravityId
@@ -165,40 +174,40 @@ async function runTest(opts: {
   }
   if (opts.badValidatorSig) {
     // Switch the first sig for the second sig to screw things up
-    sigs.v[1] = sigs.v[0];
-    sigs.r[1] = sigs.r[0];
-    sigs.s[1] = sigs.s[0];
+    sigs[1].v = sigs[0].v;
+    sigs[1].r = sigs[0].r;
+    sigs[1].s = sigs[0].s;
   }
   if (opts.zeroedValidatorSig) {
     // Switch the first sig for the second sig to screw things up
-    sigs.v[1] = sigs.v[0];
-    sigs.r[1] = sigs.r[0];
-    sigs.s[1] = sigs.s[0];
+    sigs[1].v = sigs[0].v;
+    sigs[1].r = sigs[0].r;
+    sigs[1].s = sigs[0].s;
     // Then zero it out to skip evaluation
-    sigs.v[1] = 0;
+    sigs[1].v = 0;
   }
   if (opts.notEnoughPower) {
     // zero out enough signatures that we dip below the threshold
-    sigs.v[1] = 0;
-    sigs.v[2] = 0;
-    sigs.v[3] = 0;
-    sigs.v[5] = 0;
-    sigs.v[6] = 0;
-    sigs.v[7] = 0;
-    sigs.v[9] = 0;
-    sigs.v[11] = 0;
-    sigs.v[13] = 0;
+    sigs[1].v = 0;
+    sigs[2].v = 0;
+    sigs[3].v = 0;
+    sigs[5].v = 0;
+    sigs[6].v = 0;
+    sigs[7].v = 0;
+    sigs[9].v = 0;
+    sigs[11].v = 0;
+    sigs[13].v = 0;
   }
   if (opts.barelyEnoughPower) {
     // Stay just above the threshold
-    sigs.v[1] = 0;
-    sigs.v[2] = 0;
-    sigs.v[3] = 0;
-    sigs.v[5] = 0;
-    sigs.v[6] = 0;
-    sigs.v[7] = 0;
-    sigs.v[9] = 0;
-    sigs.v[11] = 0;
+    sigs[1].v = 0;
+    sigs[2].v = 0;
+    sigs[3].v = 0;
+    sigs[5].v = 0;
+    sigs[6].v = 0;
+    sigs[7].v = 0;
+    sigs[9].v = 0;
+    sigs[11].v = 0;
   }
 
   let valset = {
@@ -212,19 +221,18 @@ async function runTest(opts: {
   let logicCallSubmitResult = await gravity.submitLogicCall(
     valset,
 
-    sigs.v,
-    sigs.r,
-    sigs.s,
+    sigs,
     logicCallArgs
   );
 
 
-    // check that the relayer was paid
-    expect(
-      await (
-        await testERC20.functions.balanceOf(await logicCallSubmitResult.from)
-      )[0].toNumber()
-    ).to.equal(9010);
+  // check that the relayer was paid
+  expect(
+    await (
+      await testERC20.functions.balanceOf(await logicCallSubmitResult.from)
+    )[0].toNumber()
+  ).to.equal(9010);
+
 
   expect(
       (await testERC20.functions.balanceOf(await signers[20].getAddress()))[0].toNumber()
@@ -246,13 +254,13 @@ async function runTest(opts: {
 describe("submitLogicCall tests", function () {
   it("throws on malformed current valset", async function () {
     await expect(runTest({ malformedCurrentValset: true })).to.be.revertedWith(
-      "Malformed current validator set"
+      "MalformedCurrentValidatorSet()"
     );
   });
 
   it("throws on invalidation nonce not incremented", async function () {
     await expect(runTest({ invalidationNonceNotHigher: true })).to.be.revertedWith(
-      "New invalidation nonce must be greater than the current nonce"
+      "InvalidLogicCallNonce(0, 0)"
     );
   });
 
@@ -260,14 +268,14 @@ describe("submitLogicCall tests", function () {
     await expect(
       runTest({ nonMatchingCurrentValset: true })
     ).to.be.revertedWith(
-      "Supplied current validators and powers do not match checkpoint"
+      "IncorrectCheckpoint()"
     );
   });
 
 
   it("throws on bad validator sig", async function () {
     await expect(runTest({ badValidatorSig: true })).to.be.revertedWith(
-      "Validator signature does not match"
+      "InvalidSignature()"
     );
   });
 
@@ -277,7 +285,7 @@ describe("submitLogicCall tests", function () {
 
   it("throws on not enough signatures", async function () {
     await expect(runTest({ notEnoughPower: true })).to.be.revertedWith(
-      "Submitted validator set signatures do not have enough power"
+      "InsufficientPower(6537, 6666)"
     );
   });
 
@@ -287,7 +295,7 @@ describe("submitLogicCall tests", function () {
 
   it("throws on timeout", async function () {
     await expect(runTest({ timedOut: true })).to.be.revertedWith(
-      "Timed out"
+      "LogicCallTimedOut()"
     );
   });
 
@@ -310,16 +318,16 @@ describe("logicCall Go test hash", function () {
       gravity,
       testERC20,
       checkpoint: deployCheckpoint
-    } = await deployContracts(gravityId, powerThreshold, validators, powers);
+    } = await deployContracts(gravityId, validators, powers, powerThreshold);
 
 
 
     // Transfer out to Cosmos, locking coins
     // =====================================
     await testERC20.functions.approve(gravity.address, 1000);
-    await gravity.functions.sendToCosmos(
+    await gravity.functions.sendToCronos(
       testERC20.address,
-      ethers.utils.formatBytes32String("myCosmosAddress"),
+      "0xffffffffffffffffffffffffffffffffffffffff",
       1000
     );
 
@@ -387,6 +395,7 @@ describe("logicCall Go test hash", function () {
     // actually execute, existing ones are too large to bother with for basic
     // signature testing
 
+
     let valset = {
       validators: await getSignerAddresses(validators),
       powers,
@@ -398,12 +407,11 @@ describe("logicCall Go test hash", function () {
     var res = await gravity.populateTransaction.submitLogicCall(
       valset,
 
-      sigs.v,
-      sigs.r,
-      sigs.s,
+      sigs,
 
       logicCallArgs
     )
+
 
     console.log("elements in logic call digest:", {
       "gravityId": gravityId,

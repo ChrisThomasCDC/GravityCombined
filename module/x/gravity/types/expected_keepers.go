@@ -5,6 +5,7 @@ import (
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	bank "github.com/cosmos/cosmos-sdk/x/bank/types"
+	distributiontypes "github.com/cosmos/cosmos-sdk/x/distribution/types"
 	slashingtypes "github.com/cosmos/cosmos-sdk/x/slashing/types"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 )
@@ -28,14 +29,27 @@ type StakingKeeper interface {
 
 // BankKeeper defines the expected bank keeper methods
 type BankKeeper interface {
+	GetSupply(ctx sdk.Context, denom string) sdk.Coin
 	SendCoinsFromModuleToAccount(ctx sdk.Context, senderModule string, recipientAddr sdk.AccAddress, amt sdk.Coins) error
+	SendCoinsFromModuleToModule(ctx sdk.Context, senderModule, recipientModule string, amt sdk.Coins) error
 	SendCoinsFromAccountToModule(ctx sdk.Context, senderAddr sdk.AccAddress, recipientModule string, amt sdk.Coins) error
 	MintCoins(ctx sdk.Context, name string, amt sdk.Coins) error
 	BurnCoins(ctx sdk.Context, name string, amt sdk.Coins) error
 	GetAllBalances(ctx sdk.Context, addr sdk.AccAddress) sdk.Coins
-	GetDenomMetaData(ctx sdk.Context, denom string) bank.Metadata
+	GetDenomMetaData(ctx sdk.Context, denom string) (bank.Metadata, bool)
 }
 
 type SlashingKeeper interface {
 	GetValidatorSigningInfo(ctx sdk.Context, address sdk.ConsAddress) (info slashingtypes.ValidatorSigningInfo, found bool)
+}
+
+// AccountKeeper defines the interface contract required for account
+// functionality.
+type AccountKeeper interface {
+	GetSequence(ctx sdk.Context, addr sdk.AccAddress) (uint64, error)
+}
+
+type DistributionKeeper interface {
+	GetFeePool(ctx sdk.Context) (feePool distributiontypes.FeePool)
+	SetFeePool(ctx sdk.Context, feePool distributiontypes.FeePool)
 }

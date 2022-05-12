@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 
 	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
@@ -14,16 +15,26 @@ const (
 // NewEthereumSignature creates a new signuature over a given byte array
 func NewEthereumSignature(hash []byte, privateKey *ecdsa.PrivateKey) ([]byte, error) {
 	if privateKey == nil {
-		return nil, sdkerrors.Wrap(ErrEmpty, "private key")
+		return nil, sdkerrors.Wrap(ErrInvalid, "did not pass in private key")
 	}
-	protectedHash := crypto.Keccak256Hash(append([]uint8(signaturePrefix), hash...))
+	protectedHash := crypto.Keccak256Hash(append([]byte(signaturePrefix), hash...))
 	return crypto.Sign(protectedHash.Bytes(), privateKey)
 }
 
-func EthAddressFromSignature(hash []byte, signature []byte) (string, error) {
+// ValidateEthereumSignature takes a message, an associated signature and public key and
+// returns an error if the signature isn't valid
+func ValidateEthereumSignature(hash []byte, signature []byte, ethAddress common.Address) error {
+
+	/// signature to public key: invalid signature length: invalid
+	/// signature not matching: invalid: invalid
 	if len(signature) < 65 {
-		return "", sdkerrors.Wrap(ErrInvalid, "signature too short")
+		return sdkerrors.Wrapf(ErrInvalid, "signature too short signature %x", signature)
 	}
+
+	// Copy to avoid mutating signature slice by accident
+	var sigCopy = make([]byte, len(signature))
+	copy(sigCopy, signature)
+
 	// To verify signature
 	// - use crypto.SigToPub to get the public key
 	// - use crypto.PubkeyToAddress to get the address
@@ -38,33 +49,19 @@ func EthAddressFromSignature(hash []byte, signature []byte) (string, error) {
 	//
 	// We could attempt to break or otherwise exit early on obviously invalid values for this
 	// byte, but that's a task best left to go-ethereum
-	if signature[64] == 27 || signature[64] == 28 {
-		signature[64] -= 27
+	if sigCopy[64] == 27 || sigCopy[64] == 28 {
+		sigCopy[64] -= 27
 	}
 
-	protectedHash := crypto.Keccak256Hash(append([]uint8(signaturePrefix), hash...))
+	hash = append([]uint8(signaturePrefix), hash...)
 
-	pubkey, err := crypto.SigToPub(protectedHash.Bytes(), signature)
+	pubkey, err := crypto.SigToPub(crypto.Keccak256Hash(hash).Bytes(), sigCopy)
 	if err != nil {
-		return "", sdkerrors.Wrap(err, "signature to public key")
+		return sdkerrors.Wrapf(err, "signature to public key sig %x hash %x", sigCopy, hash)
 	}
 
-	addr := crypto.PubkeyToAddress(*pubkey)
-
-	return addr.Hex(), nil
-}
-
-// ValidateEthereumSignature takes a message, an associated signature and public key and
-// returns an error if the signature isn't valid
-func ValidateEthereumSignature(hash []byte, signature []byte, ethAddress string) error {
-	addr, err := EthAddressFromSignature(hash, signature)
-
-	if err != nil {
-		return sdkerrors.Wrap(err, "")
-	}
-
-	if addr != ethAddress {
-		return sdkerrors.Wrap(ErrInvalid, "signature not matching")
+	if addr := crypto.PubkeyToAddress(*pubkey); addr != ethAddress {
+		return sdkerrors.Wrapf(ErrInvalid, "signature not matching addr %x sig %x hash %x", addr, signature, hash)
 	}
 
 	return nil

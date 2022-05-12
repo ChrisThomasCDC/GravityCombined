@@ -1,24 +1,24 @@
 package cli
 
 import (
-	"crypto/ecdsa"
-	"encoding/hex"
 	"fmt"
-	"log"
+	"strconv"
+	"strings"
 
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/cosmos/cosmos-sdk/client/flags"
 	"github.com/cosmos/cosmos-sdk/client/tx"
 	sdk "github.com/cosmos/cosmos-sdk/types"
-	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
-	ethCrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/cosmos/cosmos-sdk/version"
+	govtypes "github.com/cosmos/cosmos-sdk/x/gov/types"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/spf13/cobra"
 
-	"github.com/althea-net/cosmos-gravity-bridge/module/x/gravity/types"
+	"github.com/peggyjv/gravity-bridge/module/v2/x/gravity/types"
 )
 
 func GetTxCmd(storeKey string) *cobra.Command {
-	//nolint: exhaustivestruct
 	gravityTxCmd := &cobra.Command{
 		Use:                        types.ModuleName,
 		Short:                      "Gravity transaction subcommands",
@@ -27,171 +27,254 @@ func GetTxCmd(storeKey string) *cobra.Command {
 		RunE:                       client.ValidateCmd,
 	}
 
-	gravityTxCmd.AddCommand([]*cobra.Command{
-		CmdSendToEth(),
-		CmdRequestBatch(),
-		CmdSetOrchestratorAddress(),
-		GetUnsafeTestingCmd(),
-	}...)
+	gravityTxCmd.AddCommand(
+		CmdSendToEthereum(),
+		CmdCancelSendToEthereum(),
+		CmdRequestBatchTx(),
+		CmdSetDelegateKeys(),
+	)
 
 	return gravityTxCmd
 }
 
-func GetUnsafeTestingCmd() *cobra.Command {
-	//nolint: exhaustivestruct
-	testingTxCmd := &cobra.Command{
-		Use:                        "unsafe_testing",
-		Short:                      "helpers for testing. not going into production",
-		DisableFlagParsing:         true,
-		SuggestionsMinimumDistance: 2,
-		RunE:                       client.ValidateCmd,
-	}
-	testingTxCmd.AddCommand([]*cobra.Command{
-		CmdUnsafeETHPrivKey(),
-		CmdUnsafeETHAddr(),
-	}...)
-
-	return testingTxCmd
-}
-
-func CmdUnsafeETHPrivKey() *cobra.Command {
-	//nolint: exhaustivestruct
-	return &cobra.Command{
-		Use:   "gen-eth-key",
-		Short: "Generate and print a new ecdsa key",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			key, err := ethCrypto.GenerateKey()
-			if err != nil {
-				return sdkerrors.Wrap(err, "can not generate key")
-			}
-			k := "0x" + hex.EncodeToString(ethCrypto.FromECDSA(key))
-			println(k)
-			return nil
-		},
-	}
-}
-
-func CmdUnsafeETHAddr() *cobra.Command {
-	//nolint: exhaustivestruct
-	return &cobra.Command{
-		Use:   "eth-address",
-		Short: "Print address for an ECDSA eth key",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			privKeyString := args[0][2:]
-			privateKey, err := ethCrypto.HexToECDSA(privKeyString)
-			if err != nil {
-				log.Fatal(err)
-			}
-			// You've got to do all this to get an Eth address from the private key
-			publicKey := privateKey.Public()
-			publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
-			if !ok {
-				log.Fatal("error casting public key to ECDSA")
-			}
-			ethAddress := ethCrypto.PubkeyToAddress(*publicKeyECDSA).Hex()
-			println(ethAddress)
-			return nil
-		},
-	}
-}
-
-func CmdSendToEth() *cobra.Command {
-	//nolint: exhaustivestruct
+func CmdSendToEthereum() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "send-to-eth [eth-dest] [amount] [bridge-fee]",
-		Short: "Adds a new entry to the transaction pool to withdraw an amount from the Ethereum bridge contract",
-		Args:  cobra.ExactArgs(3),
+		Use:     "send-to-ethereum [ethereum-reciever] [send-coins] [fee-coins]",
+		Aliases: []string{"send", "transfer"},
+		Args:    cobra.ExactArgs(3),
+		Short:   "Send tokens from cosmos chain to connected ethereum chain",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cliCtx, err := client.GetClientTxContext(cmd)
+			clientCtx, err := client.GetClientTxContext(cmd)
 			if err != nil {
 				return err
 			}
-			cosmosAddr := cliCtx.GetFromAddress()
 
-			amount, err := sdk.ParseCoinsNormalized(args[1])
+			from := clientCtx.GetFromAddress()
+			if from == nil {
+				return fmt.Errorf("must pass from flag")
+			}
+
+			if !common.IsHexAddress(args[0]) {
+				return fmt.Errorf("must be a valid ethereum address got %s", args[0])
+			}
+
+			// Get amount of coins
+			sendCoin, err := sdk.ParseCoinNormalized(args[1])
 			if err != nil {
-				return sdkerrors.Wrap(err, "amount")
-			}
-			bridgeFee, err := sdk.ParseCoinsNormalized(args[2])
-			if err != nil {
-				return sdkerrors.Wrap(err, "bridge fee")
-			}
-
-			if len(amount) > 1 || len(bridgeFee) > 1 {
-				return fmt.Errorf("coin amounts too long, expecting just 1 coin amount for both amount and bridgeFee")
-			}
-
-			// Make the message
-			msg := types.MsgSendToEth{
-				Sender:    cosmosAddr.String(),
-				EthDest:   args[0],
-				Amount:    amount[0],
-				BridgeFee: bridgeFee[0],
-			}
-			if err := msg.ValidateBasic(); err != nil {
 				return err
 			}
-			// Send it
-			return tx.GenerateOrBroadcastTxCLI(cliCtx, cmd.Flags(), &msg)
+
+			feeCoin, err := sdk.ParseCoinNormalized(args[2])
+			if err != nil {
+				return err
+			}
+
+			msg := types.NewMsgSendToEthereum(from, common.HexToAddress(args[0]).Hex(), sendCoin, feeCoin)
+			if err = msg.ValidateBasic(); err != nil {
+				return err
+			}
+
+			return tx.GenerateOrBroadcastTxCLI(clientCtx, cmd.Flags(), msg)
 		},
 	}
+
 	flags.AddTxFlagsToCmd(cmd)
 	return cmd
 }
 
-func CmdRequestBatch() *cobra.Command {
-	//nolint: exhaustivestruct
+func CmdCancelSendToEthereum() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "build-batch [token_contract_address]",
-		Short: "Build a new batch on the cosmos side for pooled withdrawal transactions",
+		Use:   "cancel-send-to-ethereum [id]",
 		Args:  cobra.ExactArgs(1),
+		Short: "Cancel ethereum send by id",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cliCtx, err := client.GetClientTxContext(cmd)
+			clientCtx, err := client.GetClientTxContext(cmd)
 			if err != nil {
 				return err
 			}
-			cosmosAddr := cliCtx.GetFromAddress()
 
-			// TODO: better denom searching
-			msg := types.MsgRequestBatch{
-				Sender: cosmosAddr.String(),
-				Denom:  fmt.Sprintf("gravity%s", args[0]),
+			from := clientCtx.GetFromAddress()
+			if from == nil {
+				return fmt.Errorf("must pass from flag")
 			}
-			if err := msg.ValidateBasic(); err != nil {
+
+			id, err := strconv.ParseUint(args[0], 10, 64)
+			if err != nil {
 				return err
 			}
-			// Send it
-			return tx.GenerateOrBroadcastTxCLI(cliCtx, cmd.Flags(), &msg)
+
+			msg := types.NewMsgCancelSendToEthereum(id, from)
+			if err = msg.ValidateBasic(); err != nil {
+				return err
+			}
+
+			return tx.GenerateOrBroadcastTxCLI(clientCtx, cmd.Flags(), msg)
 		},
 	}
+
 	flags.AddTxFlagsToCmd(cmd)
 	return cmd
 }
 
-func CmdSetOrchestratorAddress() *cobra.Command {
-	//nolint: exhaustivestruct
+func CmdRequestBatchTx() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "set-orchestrator-address [validator-address] [orchestrator-address] [ethereum-address]",
-		Short: "Allows validators to delegate their voting responsibilities to a given key.",
-		Args:  cobra.ExactArgs(3),
+		Use:   "request-batch-tx [denom] [signer]",
+		Args:  cobra.ExactArgs(2),
+		Short: "Request batch transaction for denom by signer",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cliCtx, err := client.GetClientTxContext(cmd)
+			clientCtx, err := client.GetClientTxContext(cmd)
 			if err != nil {
 				return err
 			}
-			msg := types.MsgSetOrchestratorAddress{
-				Validator:    args[0],
-				Orchestrator: args[1],
-				EthAddress:   args[2],
-			}
-			if err := msg.ValidateBasic(); err != nil {
+
+			denom := args[0]
+			signer, err := sdk.AccAddressFromHex(args[1])
+			if err != nil {
 				return err
 			}
-			// Send it
-			return tx.GenerateOrBroadcastTxCLI(cliCtx, cmd.Flags(), &msg)
+
+			msg := types.NewMsgRequestBatchTx(denom, signer)
+			if err = msg.ValidateBasic(); err != nil {
+				return err
+			}
+			return tx.GenerateOrBroadcastTxCLI(clientCtx, cmd.Flags(), msg)
 		},
 	}
+
 	flags.AddTxFlagsToCmd(cmd)
+	return cmd
+}
+
+func CmdSetDelegateKeys() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "set-delegate-keys [validator-address] [orchestrator-address] [ethereum-address] [ethereum-signature]",
+		Args:  cobra.ExactArgs(4),
+		Short: "Set gravity delegate keys",
+		Long: `Set a validator's Ethereum and orchestrator addresses. The validator must
+sign over a binary Proto-encoded DelegateKeysSignMsg message. The message contains
+the validator's address and operator account current nonce.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clientCtx, err := client.GetClientTxContext(cmd)
+			if err != nil {
+				return err
+			}
+
+			valAddr, err := sdk.ValAddressFromBech32(args[0])
+			if err != nil {
+				return err
+			}
+
+			orcAddr, err := sdk.AccAddressFromBech32(args[1])
+			if err != nil {
+				return err
+			}
+
+			ethAddr, err := parseContractAddress(args[2])
+			if err != nil {
+				return err
+			}
+
+			ethSig, err := hexutil.Decode(args[3])
+			if err != nil {
+				return err
+			}
+
+			msg := types.NewMsgDelegateKeys(valAddr, orcAddr, ethAddr, ethSig)
+			if err = msg.ValidateBasic(); err != nil {
+				return err
+			}
+
+			return tx.GenerateOrBroadcastTxCLI(clientCtx, cmd.Flags(), msg)
+		},
+	}
+
+	flags.AddTxFlagsToCmd(cmd)
+	return cmd
+}
+
+func CmdSubmitCommunityPoolEthereumSpendProposal() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "community-pool-ethereum-spend [proposal-file]",
+		Args:  cobra.ExactArgs(1),
+		Short: "Submit a community pool Ethereum spend proposal",
+		Long: strings.TrimSpace(
+			fmt.Sprintf(`Submit a community pool Ethereum spend proposal along with an initial deposit.
+The proposal details must be supplied via a JSON file. The funds from the community pool
+will be bridged to Ethereum to the supplied recipient Ethereum address. Only one denomination
+of Cosmos token can be sent, and the bridge fee supplied along with the amount must be of the
+same denomination.
+
+Example:
+$ %s tx gov submit-proposal community-pool-ethereum-spend <path/to/proposal.json> --from=<key_or_address>
+
+Where proposal.json contains:
+
+{
+	"title": "Community Pool Ethereum Spend",
+	"description": "Bridge me some tokens to Ethereum!",
+	"recipient": "0x0000000000000000000000000000000000000000",
+	"amount": "20000stake",
+	"bridge_fee": "1000stake",
+	"deposit": "1000stake"
+}
+`,
+				version.AppName,
+			),
+		),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clientCtx, err := client.GetClientTxContext(cmd)
+			if err != nil {
+				return err
+			}
+
+			proposal, err := ParseCommunityPoolEthereumSpendProposal(clientCtx.Codec, args[0])
+			if err != nil {
+				return err
+			}
+
+			if len(proposal.Title) == 0 {
+				return fmt.Errorf("title is empty")
+			}
+
+			if len(proposal.Description) == 0 {
+				return fmt.Errorf("description is empty")
+			}
+
+			if !common.IsHexAddress(proposal.Recipient) {
+				return fmt.Errorf("recipient is not a valid Ethereum address")
+			}
+
+			amount, err := sdk.ParseCoinNormalized(proposal.Amount)
+			if err != nil {
+				return err
+			}
+
+			bridgeFee, err := sdk.ParseCoinNormalized(proposal.BridgeFee)
+			if err != nil {
+				return err
+			}
+
+			if amount.Denom != bridgeFee.Denom {
+				return fmt.Errorf("amount and bridge fee denominations must match")
+			}
+
+			deposit, err := sdk.ParseCoinsNormalized(proposal.Deposit)
+			if err != nil {
+				return err
+			}
+
+			from := clientCtx.GetFromAddress()
+
+			content := types.NewCommunityPoolEthereumSpendProposal(proposal.Title, proposal.Description, proposal.Recipient, amount, bridgeFee)
+
+			msg, err := govtypes.NewMsgSubmitProposal(content, deposit, from)
+			if err != nil {
+				return err
+			}
+
+			return tx.GenerateOrBroadcastTxCLI(clientCtx, cmd.Flags(), msg)
+		},
+	}
+
 	return cmd
 }

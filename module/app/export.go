@@ -3,7 +3,6 @@ package app
 import (
 	"encoding/json"
 	"log"
-	"time"
 
 	servertypes "github.com/cosmos/cosmos-sdk/server/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -11,7 +10,6 @@ import (
 	"github.com/cosmos/cosmos-sdk/x/staking"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
-	"github.com/tendermint/tendermint/proto/tendermint/version"
 )
 
 // ExportAppStateAndValidators exports the state of the application for a genesis
@@ -20,31 +18,7 @@ func (app *Gravity) ExportAppStateAndValidators(
 	forZeroHeight bool, jailWhiteList []string,
 ) (servertypes.ExportedApp, error) {
 
-	ctx := app.NewContext(true, tmproto.Header{
-		Version: version.Consensus{
-			Block: 0,
-			App:   0,
-		},
-		ChainID: "",
-		Height:  app.LastBlockHeight(),
-		Time:    time.Time{},
-		LastBlockId: tmproto.BlockID{
-			Hash: []byte{},
-			PartSetHeader: tmproto.PartSetHeader{
-				Total: 0,
-				Hash:  []byte{},
-			},
-		},
-		LastCommitHash:     []byte{},
-		DataHash:           []byte{},
-		ValidatorsHash:     []byte{},
-		NextValidatorsHash: []byte{},
-		ConsensusHash:      []byte{},
-		AppHash:            []byte{},
-		LastResultsHash:    []byte{},
-		EvidenceHash:       []byte{},
-		ProposerAddress:    []byte{},
-	})
+	ctx := app.NewContext(true, tmproto.Header{Height: app.LastBlockHeight()})
 
 	height := app.LastBlockHeight() + 1
 	if forZeroHeight {
